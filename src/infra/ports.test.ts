@@ -115,7 +115,12 @@ describe("ports helpers", () => {
 });
 
 describeUnix("inspectPortUsage", () => {
-  it("reports busy when lsof is missing but loopback listener exists", async () => {
+  it("reports busy when lsof is missing but loopback listener exists, suppressing ENOENT from errors (#76150)", async () => {
+    // ENOENT from spawning a missing diagnostic binary is "tool not installed",
+    // not a runtime failure. The user-visible `errors` array should not be
+    // populated with `Error: spawn lsof ENOENT` lines (which read as scary
+    // failures); the existing `install lsof or run as an admin user` hint
+    // already covers the missing-tool case for the busy/no-listeners path.
     const server = net.createServer();
     const address = await listenServer(server, 0, "127.0.0.1");
     if (!address) {
@@ -123,17 +128,73 @@ describeUnix("inspectPortUsage", () => {
     }
     const port = address.port;
 
-    runCommandWithTimeoutMock.mockRejectedValueOnce(
-      Object.assign(new Error("spawn lsof ENOENT"), { code: "ENOENT" }),
-    );
+    runCommandWithTimeoutMock.mockImplementation(async (argv: string[]) => {
+      const command = argv[0];
+      if (typeof command !== "string") {
+        return { stdout: "", stderr: "", code: 1 };
+      }
+      if (command.includes("lsof")) {
+        throw Object.assign(new Error("spawn lsof ENOENT"), { code: "ENOENT" });
+      }
+      // ss exits 1 with no stderr — readUnixListenersFromSs treats this as
+      // "no listeners found, no error to report".
+      return { stdout: "", stderr: "", code: 1 };
+    });
 
     try {
       const result = await inspectPortUsage(port);
       expect(result.status).toBe("busy");
-      expect(result.errors?.some((err) => err.includes("ENOENT"))).toBe(true);
+      expect(result.errors).toBeUndefined();
+      expect(
+        result.hints.some((hint) =>
+          hint.includes("Port is in use but process details are unavailable"),
+        ),
+      ).toBe(true);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it("surfaces 'tool not installed' as a hint, not an error, when both lsof and ss are missing on a free port (#76150)", async () => {
+    // OpenEuler / minimal containers ship without lsof and without iproute2
+    // (`ss`). The previous behavior surfaced two `Error: spawn X ENOENT`
+    // lines under "Port diagnostics errors:" in restart-health output, which
+    // the reporter on #76150 read as failures. Pin the new contract: the
+    // user gets a single informational hint naming the missing tools and
+    // no `errors` entries at all.
+    const server = net.createServer();
+    const address = await listenServer(server, 0, "127.0.0.1");
+    if (!address) {
+      return;
+    }
+    const port = address.port;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+
+    runCommandWithTimeoutMock.mockImplementation(async (argv: string[]) => {
+      const command = argv[0];
+      if (typeof command !== "string") {
+        return { stdout: "", stderr: "", code: 1 };
+      }
+      if (command.includes("lsof")) {
+        throw Object.assign(new Error("spawn lsof ENOENT"), { code: "ENOENT" });
+      }
+      if (command === "ss") {
+        throw Object.assign(new Error("spawn ss ENOENT"), { code: "ENOENT" });
+      }
+      return { stdout: "", stderr: "", code: 1 };
+    });
+
+    const result = await inspectPortUsage(port);
+    expect(result.status).toBe("free");
+    expect(result.errors).toBeUndefined();
+    expect(
+      result.hints.some(
+        (hint) =>
+          hint.includes("Diagnostic tools not installed") &&
+          hint.includes("lsof") &&
+          hint.includes("ss"),
+      ),
+    ).toBe(true);
   });
 
   it("falls back to ss when lsof is unavailable", async () => {

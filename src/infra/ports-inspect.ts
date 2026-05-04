@@ -11,7 +11,21 @@ type CommandResult = {
   stderr: string;
   code: number;
   error?: string;
+  errorCode?: string;
 };
+
+// ENOENT (binary missing), EACCES / EPERM (binary present but not executable
+// by this user) all describe a tool that is permanently unavailable on this
+// host, distinct from a tool that was found and ran but reported failure.
+// Treating them differently lets the caller surface "lsof not installed" as
+// an informational hint instead of bubbling up a misleading "Error: spawn
+// lsof ENOENT" line in user-visible diagnostics. Mirrors the same predicate
+// applied to the synchronous polling path in `restart-stale-pids.ts`.
+const TOOL_NOT_INSTALLED_SPAWN_ERROR_CODES = new Set(["ENOENT", "EACCES", "EPERM"]);
+
+function isToolNotInstalledError(res: CommandResult): boolean {
+  return res.errorCode !== undefined && TOOL_NOT_INSTALLED_SPAWN_ERROR_CODES.has(res.errorCode);
+}
 
 async function runCommandSafe(argv: string[], timeoutMs = 5_000): Promise<CommandResult> {
   try {
@@ -22,11 +36,13 @@ async function runCommandSafe(argv: string[], timeoutMs = 5_000): Promise<Comman
       code: res.code ?? 1,
     };
   } catch (err) {
+    const errorCode = (err as NodeJS.ErrnoException | undefined)?.code;
     return {
       stdout: "",
       stderr: "",
       code: 1,
       error: String(err),
+      errorCode: typeof errorCode === "string" ? errorCode : undefined,
     };
   }
 }
@@ -141,46 +157,66 @@ function parseSsListeners(output: string, port: number): PortListener[] {
   return listeners;
 }
 
-async function readUnixListenersFromSs(
-  port: number,
-): Promise<{ listeners: PortListener[]; detail?: string; errors: string[] }> {
+type ListenerReadResult = {
+  listeners: PortListener[];
+  detail?: string;
+  errors: string[];
+  unavailableTools: string[];
+};
+
+async function readUnixListenersFromSs(port: number): Promise<ListenerReadResult> {
   const errors: string[] = [];
   const res = await runCommandSafe(["ss", "-H", "-ltnp", `sport = :${port}`]);
   if (res.code === 0) {
     const listeners = parseSsListeners(res.stdout, port);
     await enrichUnixListenerProcessInfo(listeners);
-    return { listeners, detail: res.stdout.trim() || undefined, errors };
+    return {
+      listeners,
+      detail: res.stdout.trim() || undefined,
+      errors,
+      unavailableTools: [],
+    };
   }
   const stderr = res.stderr.trim();
   if (res.code === 1 && !res.error && !stderr) {
-    return { listeners: [], detail: undefined, errors };
+    return { listeners: [], detail: undefined, errors, unavailableTools: [] };
   }
-  if (res.error) {
+  const ssNotInstalled = isToolNotInstalledError(res);
+  if (res.error && !ssNotInstalled) {
     errors.push(res.error);
   }
   const detail = [stderr, res.stdout.trim()].filter(Boolean).join("\n");
   if (detail) {
     errors.push(detail);
   }
-  return { listeners: [], detail: undefined, errors };
+  return {
+    listeners: [],
+    detail: undefined,
+    errors,
+    unavailableTools: ssNotInstalled ? ["ss"] : [],
+  };
 }
 
-async function readUnixListeners(
-  port: number,
-): Promise<{ listeners: PortListener[]; detail?: string; errors: string[] }> {
+async function readUnixListeners(port: number): Promise<ListenerReadResult> {
   const lsof = await resolveLsofCommand();
   const res = await runCommandSafe([lsof, "-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-FpFcn"]);
   if (res.code === 0) {
     const listeners = parseLsofFieldOutput(res.stdout);
     await enrichUnixListenerProcessInfo(listeners);
-    return { listeners, detail: res.stdout.trim() || undefined, errors: [] };
+    return {
+      listeners,
+      detail: res.stdout.trim() || undefined,
+      errors: [],
+      unavailableTools: [],
+    };
   }
   const lsofErrors: string[] = [];
   const stderr = res.stderr.trim();
   if (res.code === 1 && !res.error && !stderr) {
-    return { listeners: [], detail: undefined, errors: [] };
+    return { listeners: [], detail: undefined, errors: [], unavailableTools: [] };
   }
-  if (res.error) {
+  const lsofNotInstalled = isToolNotInstalledError(res);
+  if (res.error && !lsofNotInstalled) {
     lsofErrors.push(res.error);
   }
   const detail = [stderr, res.stdout.trim()].filter(Boolean).join("\n");
@@ -190,13 +226,17 @@ async function readUnixListeners(
 
   const ssFallback = await readUnixListenersFromSs(port);
   if (ssFallback.listeners.length > 0) {
-    return ssFallback;
+    // ss recovered the diagnostic — lsof's absence is not user-relevant here,
+    // so swallow both the lsof error trail and the unavailable-tool note.
+    return { ...ssFallback, unavailableTools: [] };
   }
 
+  const unavailableTools = [...(lsofNotInstalled ? ["lsof"] : []), ...ssFallback.unavailableTools];
   return {
     listeners: [],
     detail: undefined,
     errors: [...lsofErrors, ...ssFallback.errors],
+    unavailableTools,
   };
 }
 
@@ -286,20 +326,19 @@ async function resolveWindowsCommandLine(pid: number): Promise<string | undefine
   return undefined;
 }
 
-async function readWindowsListeners(
-  port: number,
-): Promise<{ listeners: PortListener[]; detail?: string; errors: string[] }> {
+async function readWindowsListeners(port: number): Promise<ListenerReadResult> {
   const errors: string[] = [];
   const res = await runCommandSafe(["netstat", "-ano", "-p", "tcp"]);
   if (res.code !== 0) {
-    if (res.error) {
+    const netstatNotInstalled = isToolNotInstalledError(res);
+    if (res.error && !netstatNotInstalled) {
       errors.push(res.error);
     }
     const detail = [res.stderr.trim(), res.stdout.trim()].filter(Boolean).join("\n");
     if (detail) {
       errors.push(detail);
     }
-    return { listeners: [], errors };
+    return { listeners: [], errors, unavailableTools: netstatNotInstalled ? ["netstat"] : [] };
   }
   const listeners = parseNetstatListeners(res.stdout, port);
   await Promise.all(
@@ -319,7 +358,7 @@ async function readWindowsListeners(
       }
     }),
   );
-  return { listeners, detail: res.stdout.trim() || undefined, errors };
+  return { listeners, detail: res.stdout.trim() || undefined, errors, unavailableTools: [] };
 }
 
 async function tryListenOnHost(port: number, host: string): Promise<PortUsageStatus | "skip"> {
@@ -369,6 +408,21 @@ export async function inspectPortUsage(port: number): Promise<PortUsage> {
   if (status === "busy" && listeners.length === 0) {
     hints.push(
       "Port is in use but process details are unavailable (install lsof or run as an admin user).",
+    );
+  }
+  // Surface "tool not installed" as an informational hint instead of a raw
+  // `Error: spawn lsof ENOENT` line in `errors`. Skip when the busy/no-listeners
+  // hint above already named lsof to avoid telling the user about lsof twice.
+  const unavailableTools = result.unavailableTools.filter((tool) => {
+    if (tool === "lsof" && status === "busy" && listeners.length === 0) {
+      return false;
+    }
+    return true;
+  });
+  if (unavailableTools.length > 0) {
+    const label = unavailableTools.length > 1 ? "tools" : "tool";
+    hints.push(
+      `Diagnostic ${label} not installed: ${unavailableTools.join(", ")}. Port diagnostics are limited.`,
     );
   }
   return {

@@ -557,6 +557,12 @@ function renderPortUsageDiagnostics(snapshot: GatewayPortHealthSnapshot): string
     lines.push(...formatPortDiagnostics(snapshot.portUsage));
   } else {
     lines.push(`Gateway port ${snapshot.portUsage.port} status: ${snapshot.portUsage.status}.`);
+    // Surface non-busy hints so "Diagnostic tools not installed" notes from
+    // ports-inspect reach the user even when the port is free/unknown. The
+    // busy path already prints hints via `formatPortDiagnostics`.
+    for (const hint of snapshot.portUsage.hints) {
+      lines.push(`- ${hint}`);
+    }
   }
 
   if (snapshot.portUsage.errors?.length) {
