@@ -60,6 +60,7 @@ Docs: https://docs.openclaw.ai
 ### Fixes
 
 - Plugins/update: include beta-channel fallback details in plugin update outcomes when `@beta` is unavailable and OpenClaw uses the recorded default/latest plugin spec, making mixed beta/latest plugin cohorts visible in update summaries. Fixes #80689. Thanks @BKF-Gitty.
+- Agents/subagents: read `SPAWN_ALLOWLIST` from the host environment as a fallback for `subagents.allowAgents` in the spawn target-policy, ACP spawn, and `agents_list` paths so Docker / Coolify deployments that set `AGENTS=[…]` and `SPAWN_ALLOWLIST=*` purely through env vars get a working `sessions_spawn` allowlist instead of `allowed: none`. Comma-separated; per-agent and `agents.defaults` config still take precedence. Fixes #79490.
 - Control UI/performance: scope Nodes polling to the active Nodes tab, debounce stale session-list reconciliation, and bound chat-side session refreshes so long-running dashboards avoid background reload churn. Thanks @BunsDev.
 - Plugins/channels: explain bundled channel entry files that reach the legacy plugin loader as setup-runtime loader mismatches instead of generic missing-register failures. Thanks @chinar-amrutkar.
 - Bonjour/Gateway: treat active ciao probing and fresh name-conflict renames as in-progress so the mDNS watchdog waits for probe settlement before retrying, preventing rapid re-advertise loops on Windows, WSL, and other multicast-hostile hosts. (#74778) Refs #74242. Thanks @fuller-stack-dev.
